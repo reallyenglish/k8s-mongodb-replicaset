@@ -1,0 +1,128 @@
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: mongo
+spec:
+  serviceName: mongo-rs
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: mongo-rs
+
+    spec:
+      containers:
+        - name: server
+          image: mongo:3.4
+          command:
+            - /usr/bin/mongod
+            - --config=/config/mongod.conf
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "/usr/bin/mongo --eval 'printjson(db.serverStatus())'"
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - "/usr/bin/mongo admin --eval 'db.shutdownServer({force: true})'"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+          ports:
+            - name: mongo
+              containerPort: 27017
+              protocol: "TCP"
+          volumeMounts:
+            - mountPath: /data/db
+              name: data
+            - mountPath: /config
+              name: config
+      initContainers:
+        - name: install-tools
+          image: reallyenglish/k8s-init:0.2.0
+          args: ["--work-dir=/work-dir"]
+          volumeMounts:
+            - mountPath: /work-dir
+              name: workdir
+        - name: init-replset
+          image: mongo:3.4
+          command:
+            - "bash"
+            - "-c"
+            - |
+              MASTER=""
+              MYSELF=""
+              HOSTNAME=$(hostname)
+
+              echo "rset-init: Starting mongod on ${HOSTNAME} ..."
+              /usr/bin/mongod --config=/config/mongod.conf &
+              until /usr/bin/mongo --eval 'printjson(db.serverStatus())'; do
+                echo "rset-init: Waiting for mongod is up ..." && sleep 1
+              done
+
+              echo "rset-init: Mongod is up. Probing peers in ${SERVICE_NAME} ..."
+              for PEER in $(/work-dir/lookup-srv -srv=${SERVICE_NAME}); do
+                if [[ "${PEER}" == *"${HOSTNAME}"* ]]; then
+                  MYSELF=$PEER
+                elif /usr/bin/mongo --host=${PEER} --eval="rs.isMaster()['ismaster'] && 'ISMASTER'" | grep -q ISMASTER; then
+                  MASTER=$PEER
+                fi
+              done
+
+              if [ -z "$MASTER" ]; then
+                if /usr/bin/mongo --quiet --eval="rs.status()['set']" | grep -q ${REPLICA_SET}; then
+                  echo "rset-init: Replica set was already initialized on ${MYSELF} ..."
+                else
+                  echo "rset-init: Initializing replica set for ${MYSELF} ..."
+                  /usr/bin/mongo --eval="printjson(rs.initiate({'_id': '${REPLICA_SET}', 'members': [{'_id': 0, 'host': '${MYSELF}'}]}))"
+                fi
+              else
+                echo "rset-init: Adding myself to the replica set at ${MASTER} ..."
+                /usr/bin/mongo --host=${MASTER} --eval="printjson(rs.add('${MYSELF}'))"
+              fi
+
+              echo "rset-init: Stopping mongod on ${HOSTNAME} ..."
+              /usr/bin/mongo admin --eval 'db.shutdownServer({force: true})'
+
+          env:
+          - name: SERVICE_NAME
+            value: mongo-rs
+          - name: REPLICA_SET
+            value: rs0
+          volumeMounts:
+            - mountPath: /data/db
+              name: data
+            - mountPath: /config
+              name: config
+            - mountPath: /work-dir
+              name: workdir
+
+      volumes:
+      - name: config
+        configMap:
+          name: mongo-config
+          items:
+            - key: mongod-dot-conf
+              path: mongod.conf
+      - name: workdir
+        emptyDir: {}
+
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      annotations:
+        volume.alpha.kubernetes.io/storage-class: anything
+    spec:
+      accessModes:
+        - "ReadWriteOnce"
+      resources:
+        requests:
+          storage: 10Gi

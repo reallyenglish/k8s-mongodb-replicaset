@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-config
+data:
+  mongod-dot-conf: |
+    storage:
+      dbPath: /data/db
+    net:
+      port: 27017
+    replication:
+      replSetName: rs0
